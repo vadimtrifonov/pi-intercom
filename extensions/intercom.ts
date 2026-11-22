@@ -27,7 +27,13 @@ export default function (pi: ExtensionAPI) {
 			// pi-traceline shows the summary as the text of its one-line row.
 			details: { summary: summarize(envelope) },
 		};
-		undelivered.push(message);
+		if (ctx.mode === "tui") {
+			undelivered.push(message);
+			const runIsStopping = ctx.signal?.aborted;
+			// Pi would keep the message in its queue, unseen, until the next run.
+			// It is stored when the run ends, after the messages that arrived before it.
+			if (runIsStopping) return { action: "handled" };
+		}
 		pi.sendMessage(message, { triggerTurn: true, deliverAs: event.streamingBehavior });
 		return { action: "handled" };
 	});
@@ -38,11 +44,9 @@ export default function (pi: ExtensionAPI) {
 		if (index >= 0) undelivered.splice(index, 1);
 	});
 
-	// Pi drops its queued messages when the queue is cleared, which the TUI does before it aborts a run
-	// and when the user restores the queue to the editor. Other modes keep the queue through an abort.
-	pi.on("agent_settled", ({ aborted }, ctx) => {
-		const piKeptItsQueue = aborted && ctx.mode !== "tui";
-		if (piKeptItsQueue) return;
+	// The TUI clears Pi's queue, and the agent messages in it, before it aborts a run and when the user
+	// restores the queue to the editor. In other modes only the client clears the queue.
+	pi.on("agent_settled", () => {
 		for (const message of undelivered.splice(0)) pi.sendMessage(message, { triggerTurn: false });
 	});
 
