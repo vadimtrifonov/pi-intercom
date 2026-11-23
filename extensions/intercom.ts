@@ -1,40 +1,77 @@
-import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, type Component, Markdown, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Box, type Component, Markdown, matchesKey, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 const CUSTOM_TYPE = "intercom";
 // The quotes are optional: a shell strips them when the sender does not protect them.
 const OPENING_TAG = /^<intercom from="?([^">\n]+)"?>\s*/;
 const CLOSING_TAG = /\s*<\/intercom>\s*$/;
+const BRACKETED_PASTE = /^\x1b\[200~([\s\S]*)\x1b\[201~$/;
 const PREVIEW_LINES = 5;
 const SUMMARY_MAX_CHARS = 200;
 const HERDR_TIMEOUT_MS = 2000;
 
 type Envelope = { sender: string; body: string };
 type IntercomMessage = { customType: string; content: string; display: boolean; details: { summary: string } };
+type Delivery = { triggerTurn: boolean; deliverAs?: "steer" | "followUp" };
 
 export default function (pi: ExtensionAPI) {
 	const undelivered: IntercomMessage[] = [];
+	let inRun = false;
+
+	pi.on("before_agent_start", () => {
+		inRun = true;
+	});
+	pi.on("agent_settled", () => {
+		inRun = false;
+	});
+
+	function deliver(text: string, envelope: Envelope, ctx: ExtensionContext, delivery: Delivery) {
+		const message: IntercomMessage = {
+			customType: CUSTOM_TYPE,
+			content: text,
+			display: true,
+			// pi-traceline shows the summary as the text of its one-line row.
+			details: { summary: summarize(envelope) },
+		};
+		const waitsInPiQueue = delivery.triggerTurn && !ctx.isIdle();
+		if (waitsInPiQueue && ctx.mode === "tui") {
+			undelivered.push(message);
+			const runIsStopping = ctx.signal?.aborted;
+			// Pi would keep the message in its queue, unseen, until the next run.
+			// It is stored when the run ends, after the messages that arrived before it.
+			if (runIsStopping) return;
+		}
+		pi.sendMessage(message, delivery);
+	}
+
+	// Herdr pastes a message and presses Enter, which in the editor submits it together with the user's unsent text.
+	pi.on("session_start", (_event, ctx) => {
+		let herdrEnterIsDue = false;
+		ctx.ui.onTerminalInput((data) => {
+			const paste = BRACKETED_PASTE.exec(data)?.[1];
+			if (paste !== undefined) {
+				const text = cleanPaste(paste);
+				const envelope = parseEnvelope(text);
+				if (!envelope) return undefined;
+				// Pi is busy outside a run during `/compact` and a branch summary, and it would still start a turn then.
+				const piCanTakeTurn = ctx.isIdle() || inRun;
+				deliver(text, envelope, ctx, { triggerTurn: piCanTakeTurn });
+				herdrEnterIsDue = true;
+				return { consume: true };
+			}
+			if (herdrEnterIsDue && matchesKey(data, "enter")) {
+				herdrEnterIsDue = false;
+				return { consume: true };
+			}
+			return undefined;
+		});
+	});
 
 	pi.on("input", (event, ctx) => {
 		const envelope = parseEnvelope(event.text);
 		const exitsWhenPromptReturns = ctx.mode === "print" || ctx.mode === "json";
 		if (!envelope || event.images?.length || exitsWhenPromptReturns) return;
-
-		const message: IntercomMessage = {
-			customType: CUSTOM_TYPE,
-			content: event.text,
-			display: true,
-			// pi-traceline shows the summary as the text of its one-line row.
-			details: { summary: summarize(envelope) },
-		};
-		if (ctx.mode === "tui") {
-			undelivered.push(message);
-			const runIsStopping = ctx.signal?.aborted;
-			// Pi would keep the message in its queue, unseen, until the next run.
-			// It is stored when the run ends, after the messages that arrived before it.
-			if (runIsStopping) return { action: "handled" };
-		}
-		pi.sendMessage(message, { triggerTurn: true, deliverAs: event.streamingBehavior });
+		deliver(event.text, envelope, ctx, { triggerTurn: true, deliverAs: event.streamingBehavior });
 		return { action: "handled" };
 	});
 
@@ -79,6 +116,13 @@ export default function (pi: ExtensionAPI) {
 			].join("\n");
 		});
 	}
+}
+
+function cleanPaste(text: string): string {
+	return text
+		.replace(/\r\n?/g, "\n")
+		.replace(/[\x00-\x08\x0b-\x1f]/g, "")
+		.trim();
 }
 
 function parseEnvelope(text: string): Envelope | undefined {
